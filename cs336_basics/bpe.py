@@ -215,7 +215,6 @@ class Tokenizer:
             vocab_len=len(self.vocab)
             for i in range(stlen):
                 vocab[i+vocab_len]=unique_st[i]
-        self.offset = next(k for k, v in self.vocab.items() if v == b'\x00')
         self.byte_to_id = {v: k for k, v in self.vocab.items()}
         self.merge_map = {}
         for i, (p0, p1) in enumerate(merges):
@@ -224,15 +223,6 @@ class Tokenizer:
             # 拼接 bytes，去 byte_to_id 查它真实的 ID
             combined_bytes = p0 + p1
             self.merge_map[(id0, id1)] = self.byte_to_id[combined_bytes]
-        self.byte_to_id_map_origin = {}
-        for i in range(256):
-            byte_obj = bytes([i])
-            # 在你已经建立好的 self.byte_to_id (bytes -> id) 中查找
-            if byte_obj in self.byte_to_id:
-                self.byte_to_id_map_origin[i] = self.byte_to_id[byte_obj]
-            else:
-                # 如果词表不完整，至少报错或记录，这通常意味着词表有问题
-                pass
 
 
 
@@ -297,7 +287,7 @@ class Tokenizer:
 
     def encode_word(self,word:str)->list[int]:
         word_bytes = word.encode('utf-8')
-        word = [self.byte_to_id_map_origin[b] for b in word_bytes]
+        word = [self.byte_to_id[bytes([b])] for b in word_bytes]
 
 
         while True:
