@@ -3,8 +3,8 @@ from einops import rearrange, einsum
 import math
 
 import os
-from collections.abc import Iterable
-from typing import IO, Any, BinaryIO
+from collections.abc import Iterable,Callable
+from typing import IO, Any, BinaryIO, Optional
 
 import numpy.typing as npt
 from jaxtyping import Bool, Float, Int
@@ -418,3 +418,111 @@ def cross_entropy(
     expsum=torch.exp(inputs).sum(dim=-1)
     result=torch.log(expsum)-inputs[torch.arange(inputs.shape[0]), targets]
     return result.mean()
+
+
+class SGD(torch.optim.Optimizer):
+    def __init__(self, params, lr=1e-3):
+        if lr < 0:
+            raise ValueError(f"Invalid learning rate: {lr}")
+        defaults = {"lr": lr}
+        super().__init__(params, defaults)
+    def step(self, closure: Optional[Callable] = None):
+        loss = None if closure is None else closure()
+        for group in self.param_groups:
+            lr = group["lr"]  # Get the learning rate.
+            for p in group["params"]:
+                if p.grad is None:
+                    continue
+                state = self.state[p]  # Get state associated with p.
+                t = state.get("t", 0)  # Get iteration number from the state, or 0.
+                grad = p.grad.data  # Get the gradient of loss with respect to p.
+                p.data -= lr / math.sqrt(t + 1) * grad  # Update weight tensor in-place.
+                state["t"] = t + 1  # Increment iteration number.
+        return loss
+
+
+class AdamW(torch.optim.Optimizer):
+    def __init__(self,params,lr=1e-3, betas=(0.9, 0.999), eps=1e-8, weight_decay=1e-2):
+        if lr < 0.0: raise ValueError(f"Invalid learning rate: {lr}")
+        if not 0.0 <= betas[0] < 1.0: raise ValueError(f"Invalid beta1: {betas[0]}")
+        if weight_decay < 0.0: raise ValueError(f"Invalid weight_decay: {weight_decay}")
+        defaults = {'lr':lr, 'betas':betas, 'eps':eps, 'weight_decay':weight_decay}
+        super().__init__(params, defaults)
+
+    @torch.no_grad()
+    def step(self,closure: Optional[Callable] = None):
+        loss = None if closure is None else closure()
+        for group in self.param_groups:
+            lr = group["lr"]  # Get the learning rate.
+            weight_dacay=group['weight_decay']
+            eps=group['eps']
+            for p in group["params"]:
+                if p.grad is None:
+                    continue
+                state = self.state[p]  # Get state associated with p.
+                t = state.get("t", 1)  # Get iteration number from the state, or 0.
+                v=state.get('v',torch.zeros_like(p))
+                m=state.get('m',torch.zeros_like(p))
+                beta1=group['betas'][0]
+                beta2=group['betas'][1]
+                lrt=lr*math.sqrt(1-math.pow(beta2,t))/(1-math.pow(beta1,t))
+                grad = p.grad.data  
+                p.data.mul_(1 - lr*weight_dacay) #p.data -= lr*weight_dacay*p.data的原位计算
+                m.mul_(beta1).add_(grad, alpha=1 - beta1) #m=beta1*m+(1-beta1)*grad
+                v.mul_(beta2).addcmul_(grad, grad, value=1 - beta2) #v=beta2*v+(1-beta2)*grad*grad
+                denom = v.sqrt().add_(eps) #p.data-=lrt*m/(torch.sqrt(v)+eps)
+                p.data.addcdiv_(m, denom, value=-lrt)
+                state["t"] = t + 1
+                state['m']=m
+                state['v']=v
+        return loss
+    
+def get_lr_cosine_schedule(
+    it: int,
+    max_learning_rate: float,
+    min_learning_rate: float,
+    warmup_iters: int,
+    cosine_cycle_iters: int,
+):
+    if it<warmup_iters:
+        return it/warmup_iters*max_learning_rate
+    else:
+        if it<=cosine_cycle_iters:
+            return min_learning_rate+0.5*(1+math.cos((it-warmup_iters)*math.pi/(cosine_cycle_iters-warmup_iters)))*(max_learning_rate-min_learning_rate)
+        else:
+            return min_learning_rate
+        
+def gradient_clipping(parameters: Iterable[torch.nn.Parameter], max_l2_norm: float) -> None:
+    params_with_grad = [p for p in parameters if p.grad is not None]
+    if not params_with_grad:
+        return
+    device = params_with_grad[0].grad.device
+    total_norm = torch.norm(
+        torch.stack([torch.norm(p.grad.detach(), 2).to(device) for p in params_with_grad]), 2)
+    clip_coeff = max_l2_norm / (total_norm + 1e-6)
+    if clip_coeff < 1.0:
+        for p in params_with_grad:
+            p.grad.detach().mul_(clip_coeff)
+
+def get_batch(
+    dataset: npt.NDArray, batch_size: int, context_length: int, device: str
+) -> tuple[torch.Tensor, torch.Tensor]:
+    ix = torch.randint(len(dataset) - context_length, (batch_size,))
+    x_list = [torch.from_numpy(dataset[i:i+context_length]) for i in ix]
+    y_list = [torch.from_numpy(dataset[i+1:i+1+context_length]) for i in ix]
+    X = torch.stack(x_list)
+    Y = torch.stack(y_list)
+    return (X.to(device),Y.to(device))
+
+def save_checkpoint(model, optimizer, iteration, out):
+    checkpoint={'iteration':iteration,
+                'model':model.state_dict(),
+                'optimizer':optimizer.state_dict()}
+    torch.save(checkpoint,out)
+    return
+
+def load_checkpoint(src, model, optimizer):
+    checkpoint=torch.load(src)
+    model.load_state_dict(checkpoint['model'])
+    optimizer.load_state_dict(checkpoint['optimizer'])
+    return checkpoint['iteration']
