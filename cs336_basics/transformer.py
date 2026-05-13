@@ -1,7 +1,7 @@
 import torch
 from einops import rearrange, einsum
 import math
-
+import sys
 import os
 from collections.abc import Iterable,Callable
 from typing import IO, Any, BinaryIO, Optional
@@ -9,6 +9,8 @@ import numpy as np
 import numpy.typing as npt
 from jaxtyping import Bool, Float, Int
 from torch import Tensor
+sys.path.insert(0, "/home/zhang/projects/cs336/cs336-assignment1")
+from cs336_basics.bpe import tokenize,Tokenizer
 
 class Linear(torch.nn.Module):
     def __init__(self, in_features, out_features, device=None, dtype=None):
@@ -525,7 +527,15 @@ def save_checkpoint(model, optimizer, iteration, out):
 
 def load_checkpoint(src, model, optimizer):
     checkpoint=torch.load(src)
-    model.load_state_dict(checkpoint['model'])
+    state_dict = checkpoint['model']
+    from collections import OrderedDict
+    new_state_dict = OrderedDict()
+    
+    for k, v in state_dict.items():
+        # 如果键名以 'module.' 开头，则截取掉这 7 个字符
+        name = k[7:] if k.startswith('module.') else k
+        new_state_dict[name] = v
+    model.load_state_dict(new_state_dict)
     optimizer.load_state_dict(checkpoint['optimizer'])
     return checkpoint['iteration']
 
@@ -654,4 +664,12 @@ def decode(
 
 
 if __name__ == "__main__":
-    model=train(10000,256,512,4,16,1344,'/home/zhang/projects/cs336/cs336-assignment1/data/check.pt',128,10000,'/home/zhang/projects/cs336/cs336-assignment1/data/train_tokens.bin',1000,10000,device='cuda:0',dtype=torch.bfloat16)
+    '''model=train(10000,256,512,4,16,1344,'/home/zhang/projects/cs336/cs336-assignment1/data/check.pt',128,10000,'/home/zhang/projects/cs336/cs336-assignment1/data/train_tokens.bin',1000,10000,device='cuda:0',dtype=torch.bfloat16)'''
+    model=Transformer(10000,256,512,4,16,1344,10000,weights=None,device='cuda:0',dtype=torch.bfloat16)
+    optimizer=AdamW(model.parameters())
+    load_checkpoint('/home/zhang/projects/cs336/cs336-assignment1/model/check.pt',model,optimizer)
+    tokenizer=Tokenizer.from_files('/home/zhang/projects/cs336/cs336-assignment1/bpe_tinystories/vocab_10000.json','/home/zhang/projects/cs336/cs336-assignment1/bpe_tinystories/merge_10000.txt',['<|endoftext|>'])
+    prompt='''Deep in the heart of the Whispering Woods, there lived a tiny squirrel named Pip. Unlike the other squirrels who spent their days gathering brown nuts, Pip was a dreamer. One chilly autumn evening,'''
+    encoded=tokenizer.encode(prompt)
+    result=decode(model,encoded,150,1,0.9,0)
+    print(tokenizer.decode(result))
