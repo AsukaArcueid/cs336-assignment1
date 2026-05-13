@@ -6,6 +6,7 @@ from concurrent.futures import ProcessPoolExecutor
 import time
 from collections.abc import Iterable, Iterator
 import json
+import numpy as np
 
 PAT = r"""'(?:[sdmt]|ll|ve|re)| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+"""
 
@@ -280,6 +281,7 @@ class Tokenizer:
     
     
     def decode(self, ids: list[int]) -> str:
+        ids=ids.tolist()
         ans=b''
         for i in ids:
             ans+=self.vocab.get(i)
@@ -328,13 +330,45 @@ class Tokenizer:
 
 
 if __name__ == "__main__":
-    '''vocab, merges = tokenize('/home/zhang/projects/cs336/cs336-assignment1/data/TinyStoriesV2-GPT4-train.txt', 50000, ['<|endoftext|>'], 10)
+    '''vocab, merges = tokenize('/home/zhang/projects/cs336/cs336-assignment1/data/TinyStoriesV2-GPT4-train.txt', 10000, ['<|endoftext|>'], 10)
     #print(vocab)
     print('\n')
     longest = max(vocab.items(), key=lambda x: len(x[1]))
     print(f"Longest token: {longest[1]} (id={longest[0]}, len={len(longest[1])})")
-    save(vocab,merges,'/home/zhang/projects/cs336/cs336-assignment1/bpe_tinystories/vocab.json','/home/zhang/projects/cs336/cs336-assignment1/bpe_tinystories/merge.txt')'''
-    tokenizer=Tokenizer.from_files('/home/zhang/projects/cs336/cs336-assignment1/bpe_tinystories/vocab.json','/home/zhang/projects/cs336/cs336-assignment1/bpe_tinystories/merge.txt',['<|im_start|>','<|endoftext|>'])
+    save(vocab,merges,'/home/zhang/projects/cs336/cs336-assignment1/bpe_tinystories/vocab_10000.json','/home/zhang/projects/cs336/cs336-assignment1/bpe_tinystories/merge_10000.txt')'''
+    '''tokenizer=Tokenizer.from_files('/home/zhang/projects/cs336/cs336-assignment1/bpe_tinystories/vocab.json','/home/zhang/projects/cs336/cs336-assignment1/bpe_tinystories/merge.txt',['<|im_start|>','<|endoftext|>'])
     encoded =tokenizer.encode('Hello world! <|endoftext|> This is a BPE tokenizer test with 12345 numbers and "multiple" symbols. <|im_start|>')
     print(encoded)
-    print(tokenizer.decode(encoded))
+    print(tokenizer.decode(encoded))'''
+    tokenizer=Tokenizer.from_files('/home/zhang/projects/cs336/cs336-assignment1/bpe_tinystories/vocab_10000.json','/home/zhang/projects/cs336/cs336-assignment1/bpe_tinystories/merge_10000.txt',['<|endoftext|>'])
+    input_file = '/home/zhang/projects/cs336/cs336-assignment1/data/TinyStoriesV2-GPT4-train.txt'
+    output_bin = '/home/zhang/projects/cs336/cs336-assignment1/data/train_tokens.bin'
+    eos_token = '<|endoftext|>'
+    eos_bytes = eos_token.encode('utf-8')
+    print(f"Starting to tokenize {input_file}...")
+    
+    with open(input_file, "rb") as f:
+        # 2. 利用你已有的函数寻找基于 EOS 的边界
+        # 假设我们想把 2GB 分成 100 个大的逻辑块来处理
+        print("Finding boundaries based on EOS...")
+        boundaries = find_chunk_boundaries(f, desired_num_chunks=100, split_special_token=eos_bytes)
+        
+        with open(output_bin, 'wb') as f_out:
+            # 3. 按照边界读取并 encode
+            for i in range(len(boundaries) - 1):
+                start = boundaries[i]
+                end = boundaries[i+1]
+                
+                f.seek(start)
+                # 读取一整块完整的（包含多个完整故事的）文本
+                chunk_text = f.read(end - start).decode('utf-8', errors='replace')
+                
+                if chunk_text:
+                    # 编码这一块
+                    ids = tokenizer.encode(chunk_text)
+                    # 写入二进制文件
+                    np.array(ids, dtype=np.uint16).tofile(f_out)
+                    
+                print(f"Processed chunk {i+1}/{len(boundaries)-1} (Size: {(end-start)/1024/1024:.2f} MB)")
+
+    print(f"Done! Saved to {output_bin}")

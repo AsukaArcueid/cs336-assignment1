@@ -5,7 +5,7 @@ import math
 import os
 from collections.abc import Iterable,Callable
 from typing import IO, Any, BinaryIO, Optional
-
+import numpy as np
 import numpy.typing as npt
 from jaxtyping import Bool, Float, Int
 from torch import Tensor
@@ -44,7 +44,7 @@ class RMSNorm(torch.nn.Module):
         in_dtype = x.dtype
         x = x.to(torch.float32)
         rms=(x.square().mean(dim=-1, keepdim=True) + self.eps).sqrt()
-        result = x/rms*self.g
+        result = (x / rms) * self.g.to(torch.float32)
         return result.to(in_dtype)
     
 
@@ -94,13 +94,15 @@ class RotaryPositionalEmbedding(torch.nn.Module):
         # 这里需要确保 inv_freq 的维度能和 token_positions 匹配
         # token_positions: (B, S) -> (B, S, 1)
         # inv_freq: (d_k//2) -> (1, 1, d_k//2)
+        device = x.device
+        dtype = x.dtype
         if token_positions is None:
             # x 的形状假设为 [Batch, Num_Heads, Seq_Len, Head_Dim]
             seq_len = x.shape[-2] 
-            device = x.device
             # 生成 [0, 1, 2, ..., seq_len-1] 并扩展到与 Batch 一致
-            token_positions = torch.arange(seq_len, device=device).unsqueeze(0)
+            token_positions = torch.arange(seq_len, device=device).unsqueeze(0).to(device)
         angles = token_positions.unsqueeze(-1) * self.inv_freq.reshape(1, 1, -1)
+        angles = angles.to(dtype)
 
         # 2. 生成 cos 和 sin
         cos_emb = angles.cos()  # [B, S, d_k//2]
@@ -170,7 +172,7 @@ def multihead_self_attention_with_rope(
     in_features: Float[Tensor, " ... sequence_length d_model"],
     token_positions: Int[Tensor, " ... sequence_length"] | None = None,
 ) -> Float[Tensor, " ... sequence_length d_model"]:
-    rpe=RotaryPositionalEmbedding(theta,d_model/num_heads,max_seq_len)
+    rpe=RotaryPositionalEmbedding(theta,d_model/num_heads,max_seq_len,device=in_features.device)
     Q=einsum(q_proj_weight,in_features,'hdk d_model,... sequence_length d_model->... sequence_length hdk')
     K=einsum(k_proj_weight,in_features,'hdk d_model,... sequence_length d_model->... sequence_length hdk')
     V=einsum(v_proj_weight,in_features,'hdv d_model,... sequence_length d_model->... sequence_length hdv')
@@ -180,7 +182,7 @@ def multihead_self_attention_with_rope(
     Q=rpe.forward(Q,token_positions)
     K=rpe.forward(K,token_positions)
     seq_len = in_features.shape[-2]
-    mask = ~torch.triu(torch.ones(seq_len, seq_len), diagonal=1).bool()
+    mask = ~torch.triu(torch.ones(seq_len, seq_len,device=in_features.device), diagonal=1).bool()
     X=rearrange(scaled_dot_product_attention(Q,K,V,mask=mask),'... h seq dv->... seq (h dv)')
     return einsum(o_proj_weight,X,'d hdv,... seq hdv->... seq d')
 
@@ -416,7 +418,7 @@ def cross_entropy(
     max_value,_=inputs.max(dim=-1,keepdim=True)
     inputs=inputs-max_value
     expsum=torch.exp(inputs).sum(dim=-1)
-    result=torch.log(expsum)-inputs[torch.arange(inputs.shape[0]), targets]
+    result=torch.log(expsum)-inputs[torch.arange(inputs.shape[0],device=inputs.device), targets]
     return result.mean()
 
 
@@ -508,8 +510,8 @@ def get_batch(
     dataset: npt.NDArray, batch_size: int, context_length: int, device: str
 ) -> tuple[torch.Tensor, torch.Tensor]:
     ix = torch.randint(len(dataset) - context_length, (batch_size,))
-    x_list = [torch.from_numpy(dataset[i:i+context_length]) for i in ix]
-    y_list = [torch.from_numpy(dataset[i+1:i+1+context_length]) for i in ix]
+    x_list = [torch.from_numpy(dataset[i:i+context_length]).long() for i in ix]
+    y_list = [torch.from_numpy(dataset[i+1:i+1+context_length]).long() for i in ix]
     X = torch.stack(x_list)
     Y = torch.stack(y_list)
     return (X.to(device),Y.to(device))
@@ -526,3 +528,130 @@ def load_checkpoint(src, model, optimizer):
     model.load_state_dict(checkpoint['model'])
     optimizer.load_state_dict(checkpoint['optimizer'])
     return checkpoint['iteration']
+
+def train(vocab_size: int,
+    context_length: int,
+    d_model: int,
+    num_layers: int,
+    num_heads: int,
+    d_ff: int,
+    out,
+    batch_size,
+    iteration_step,
+    data_source,
+    warmup_iters,
+    cosine_cycle_iters,
+    device=None,
+    dtype=None,
+    rope_theta=10000,
+    lr=1e-3, 
+    min_learning_rate=1e-4, #将lr当作max_learning_rate
+    betas=(0.9, 0.999), 
+    eps=1e-8, 
+    weight_decay=1e-2,
+    max_norm=1,
+    save_every=None,
+    ):
+    model=Transformer(vocab_size,context_length,d_model,num_layers,num_heads,d_ff,rope_theta,weights=None,device=device,dtype=dtype)
+    model.to(device)
+    optimizer=AdamW(model.parameters(),lr,betas,eps,weight_decay)
+    data=np.memmap(data_source,dtype=np.uint16,mode='r')
+    for i in range(iteration_step):
+        # 1. 计算当前步对应的学习率
+        current_lr = get_lr_cosine_schedule(
+            it=i, 
+            max_learning_rate=lr, 
+            min_learning_rate=min_learning_rate, 
+            warmup_iters=warmup_iters, 
+            cosine_cycle_iters=cosine_cycle_iters
+        )
+        
+        # 2. 将计算出的学习率注入优化器
+        for param_group in optimizer.param_groups:
+            param_group['lr'] = current_lr
+
+        (X,Y)=get_batch(data,batch_size,context_length,device)
+        result=model.forward(X)
+        loss=cross_entropy(rearrange(result,'batch seq vocab->(batch seq) vocab'),rearrange(Y,'batch seq->(batch seq)'))
+        optimizer.zero_grad()
+        loss.backward()
+        gradient_clipping(model.parameters(),max_norm)
+        optimizer.step()
+        if save_every is not None:
+            if i%save_every==0 and i!=0:
+                save_checkpoint(model,optimizer,i,out)
+        print(f'iter{i}:loss={loss.item()}')
+    save_checkpoint(model,optimizer,iteration_step,out)
+    return model
+
+@torch.no_grad()
+def decode(
+    model, 
+    prompt: torch.Tensor, 
+    max_tokens: int, 
+    temperature: float = 1.0, 
+    top_p: float = 1.0, 
+    eos_token_id: int = None
+):
+    """
+    参数:
+        model: Transformer 模型
+        prompt: 输入提示词 Tensor, 形状为 (batch, seq_len)
+        max_tokens: 最大生成长度
+        temperature: 温度参数 tau (公式 23)
+        top_p: 核采样阈值 p (公式 24)
+        eos_token_id: 停止符 ID (如 <|endoftext|>)
+    """
+    model.eval()
+    device = next(model.parameters()).device
+    if isinstance(prompt, list):
+        curr_input = torch.tensor(prompt, dtype=torch.long,device=device)
+    else:
+        curr_input = prompt.to(device)
+    
+    for _ in range(max_tokens):
+        # logits 形状: (seq_len, vocab_size) -> 取 (-1, :)
+        logits = model(curr_input)[-1, :]
+        
+        if temperature != 1.0:
+            logits = logits / max(temperature, 1e-8)
+        
+        # 转化为概率分布
+        probs = softmax(logits, i=-1)
+        
+        # 3. 应用 Top-p
+        if top_p < 1.0:
+            sorted_probs, sorted_indices = torch.sort(probs, descending=True, dim=-1)
+            current_sum = 0.0
+            cutoff_idx = 0
+
+            for i in range(len(sorted_probs)):
+                current_sum += sorted_probs[i]
+                cutoff_idx = i
+                if current_sum >= top_p:
+                    break
+            sorted_probs[cutoff_idx + 1 :] = 0.0
+            sorted_probs = sorted_probs / sorted_probs.sum()
+            # 4. 从分布中采样下一个 Token
+            next_token = sorted_indices[torch.multinomial(sorted_probs, num_samples=1)]
+        else:
+            next_token = torch.multinomial(probs, num_samples=1)
+        
+        # 5. 拼接到当前序列
+        curr_input = torch.cat([curr_input, next_token], dim=0)
+        
+        # 6. 检查是否生成了 EOS 停止符
+        if eos_token_id is not None and (next_token == eos_token_id).all():
+            break
+            
+    return curr_input
+
+
+
+
+
+
+
+
+if __name__ == "__main__":
+    model=train(10000,256,512,4,16,1344,'/home/zhang/projects/cs336/cs336-assignment1/data/check.pt',128,10000,'/home/zhang/projects/cs336/cs336-assignment1/data/train_tokens.bin',1000,10000,device='cuda:0',dtype=torch.bfloat16)
